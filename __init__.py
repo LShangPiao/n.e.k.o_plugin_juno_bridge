@@ -34,7 +34,6 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 import httpx
-
 from plugin.sdk.plugin import (
     NekoPluginBase,
     Ok,
