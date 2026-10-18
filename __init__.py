@@ -31,6 +31,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -46,6 +47,11 @@ from plugin.sdk.plugin import (
 
 DEFAULT_BRIDGE_URL = "http://127.0.0.1:21577"
 _USER_AGENT = "NekoJunoBridge/0.1 (+https://xhth.top/)"
+
+# 自动播报：push_message 的合并键。同一个 key 的排队消息只会保留最新一条，
+# 所以后台按固定间隔反复推也不会把角色的上下文越堆越长。
+AUTO_BRIEF_COALESCE_KEY = "juno_auto_brief"
+AUTO_BRIEF_PREFIX = "【朱诺自动播报】"
 
 
 # ---------------------------------------------------------------------------
@@ -598,12 +604,18 @@ class JunoBridgePlugin(NekoPluginBase):
         self._client: Optional[httpx.AsyncClient] = None
         self._client_loop: Any = None
 
+        # 自动播报（游戏在跑就自己在后台读遥测，推进角色上下文）
+        self._auto_brief_enabled: bool = True
+        self._auto_brief_interval: float = 20.0
+        self._auto_brief_task: Any = None
+        self._auto_brief_stop: Any = None
+        self._auto_brief_last_text: str = ""
+        self._auto_brief_last_ok: Optional[bool] = None
+
     # -- 基础设施 ---------------------------------------------------------
 
     def _get_client(self) -> httpx.AsyncClient:
         """按事件循环缓存客户端（宿主会在不同 asyncio.run 中调用）。"""
-        import asyncio
-
         try:
             loop: Any = asyncio.get_running_loop()
         except RuntimeError:  # pragma: no cover
@@ -644,6 +656,105 @@ class JunoBridgePlugin(NekoPluginBase):
         except ValueError as exc:
             raise SdkError("朱诺桥接服务返回的内容不是合法 JSON。") from exc
 
+    # -- 自动播报 ---------------------------------------------------------
+
+    async def _auto_brief_once(self) -> None:
+        """读一次遥测，把最新情况推进角色上下文（不打断对话）。
+
+        用 `ai_behavior="read"`：消息进 LLM 上下文但不会立刻触发一轮对话，
+        主人下次开口时角色已经知道火箭什么状况，不用再主动去调工具。
+        """
+        try:
+            state = await self._get_json("/state")
+            connected = True
+        except SdkError:
+            state = {}
+            connected = False
+        except Exception as exc:  # pragma: no cover
+            self.logger.debug("自动播报读取失败: {}", exc)
+            return
+
+        if connected:
+            text = _auto_brief_line(state)
+            if not text:
+                # 不在飞行场景（主菜单/设计器/加载中），这条不用发。
+                self._auto_brief_last_ok = True
+                return
+        else:
+            if not self._auto_brief_last_ok:
+                # 从来没连上过就别灌噪音了，主人自己会问。
+                return
+            text = f"{AUTO_BRIEF_PREFIX}游戏已经退出或断开了，读不到新的遥测数据。"
+
+        if connected == self._auto_brief_last_ok and text == self._auto_brief_last_text:
+            return
+
+        try:
+            result = self.push_message(
+                visibility=[],
+                ai_behavior="read",
+                coalesce_key=AUTO_BRIEF_COALESCE_KEY,
+                source="juno_auto_brief",
+                parts=[{"type": "text", "text": text}],
+            )
+            if not _as_dict(result).get("submitted"):
+                self.logger.debug("自动播报未进队: {}", result)
+        except Exception as exc:  # pragma: no cover
+            self.logger.debug("自动播报推送失败: {}", exc)
+            return
+
+        self._auto_brief_last_ok = connected
+        self._auto_brief_last_text = text
+
+    def _start_auto_brief(self) -> None:
+        """起后台轮询任务（幂等）。"""
+        # 用 getattr：测试里常用 __new__ 造实例，没走 __init__。
+        task = getattr(self, "_auto_brief_task", None)
+        if task is not None and not task.done():
+            return
+        try:
+            self._auto_brief_stop = asyncio.Event()
+            self._auto_brief_task = asyncio.create_task(self._auto_brief_loop())
+        except RuntimeError:  # pragma: no cover - 没有事件循环（单测/同步启动）
+            self._auto_brief_stop = None
+            self._auto_brief_task = None
+
+    async def _stop_auto_brief(self) -> None:
+        """停掉后台轮询任务（幂等）。"""
+        # 用 getattr：测试里常用 __new__ 造实例，没走 __init__。
+        task = getattr(self, "_auto_brief_task", None)
+        stop = getattr(self, "_auto_brief_stop", None)
+        self._auto_brief_task = None
+        self._auto_brief_stop = None
+        if stop is not None:
+            stop.set()
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # pragma: no cover
+                self.logger.debug("自动播报任务收尾出错: {}", exc)
+
+    async def _auto_brief_loop(self) -> None:
+        """按间隔循环播报，直到被叫停。"""
+        stop = self._auto_brief_stop
+        while stop is not None and not stop.is_set():
+            try:
+                await self._auto_brief_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover
+                self.logger.debug("自动播报循环出错: {}", exc)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=self._auto_brief_interval)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                raise
+            return
+
     # -- 生命周期 ---------------------------------------------------------
 
     @lifecycle(id="startup")
@@ -665,18 +776,30 @@ class JunoBridgePlugin(NekoPluginBase):
             self._timeout = 12.0
         self._timeout = min(max(self._timeout, 3.0), 60.0)
 
-        self.logger.info(
-            "JunoBridge 已就绪（只读模式），桥接地址={}",
-            self._bridge_url,
+        self._auto_brief_enabled = _as_bool(section.get("auto_brief_enabled"), True)
+        brief_interval = _num(section.get("auto_brief_interval_seconds"))
+        self._auto_brief_interval = (
+            min(max(brief_interval, 5.0), 300.0) if brief_interval is not None else 20.0
         )
+
+        self.logger.info(
+            "JunoBridge 已就绪（只读模式），桥接地址={}，自动播报={}",
+            self._bridge_url,
+            f"开/{self._auto_brief_interval:g}s" if self._auto_brief_enabled else "关",
+        )
+        if self._auto_brief_enabled:
+            self._start_auto_brief()
         return Ok({
             "status": "ready",
             "mode": "read-only",
             "bridge_url": self._bridge_url,
+            "auto_brief": self._auto_brief_enabled,
+            "auto_brief_interval_seconds": self._auto_brief_interval,
         })
 
     @lifecycle(id="shutdown")
     async def on_shutdown(self, **_):
+        await self._stop_auto_brief()
         client = self._client
         self._client = None
         self._client_loop = None
@@ -1220,6 +1343,18 @@ def _summarize_state(state: Dict[str, Any]) -> str:
         text += " 游戏现在是暂停状态。"
 
     return text
+
+
+def _auto_brief_line(state: Dict[str, Any]) -> str:
+    """把 /state 压成一行自动播报。
+
+    模组通了但游戏不在飞行场景时返回空串，表示「这条不用发」—— 主菜单、
+    设计器、加载中反复播报「读不到飞行数据」只是浪费上下文。
+    刻意压短：这一段会一直待在上下文里，跟着每一轮对话走。
+    """
+    if not _as_bool(_as_dict(state).get("ok")):
+        return ""
+    return AUTO_BRIEF_PREFIX + _summarize_state(state)
 
 
 def _summarize_orbit(orbit: Dict[str, Any]) -> str:
