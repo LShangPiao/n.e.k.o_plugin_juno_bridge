@@ -54,7 +54,12 @@ _IN_FLIGHT: Dict[str, Any] = {
         "inclination": 0.5,
         "period": 1900.0,
     },
-    "resources": {"fuel_all_stages_percent": 0.84},
+    "resources": {
+        "fuel_all_stages_percent": 0.84,
+        "delta_v_stage": 3200.0,
+        "thrust_to_weight": 1.42,
+        "battery": 0.91,
+    },
 }
 
 _NOT_IN_FLIGHT: Dict[str, Any] = {
@@ -89,6 +94,39 @@ def test_line_is_empty_for_empty_payload() -> None:
 
 def test_line_has_no_double_prefix() -> None:
     assert _auto_brief_line(_IN_FLIGHT).count(AUTO_BRIEF_PREFIX) == 1
+
+
+def test_line_carries_resources_so_detail_questions_need_no_tool() -> None:
+    """「油还够吗」「Delta-V 多少」不该再走一次工具往返。"""
+    text = _auto_brief_line(_IN_FLIGHT)
+    assert "Delta-V 3,200" in text
+    assert "推重比 1.42" in text
+    assert "全船燃料 84%" in text
+    assert "电量 91%" in text
+
+
+def test_line_hides_fuel_when_summarize_state_already_warns() -> None:
+    """燃料见底时 _summarize_state 已经专门警告，别重复念两遍。"""
+    state = dict(_IN_FLIGHT)
+    state["resources"] = dict(_IN_FLIGHT["resources"], fuel_all_stages_percent=0.03)
+    text = _auto_brief_line(state)
+    assert "全船燃料 3%" not in text
+    assert "快见底了" in text
+
+
+def test_line_survives_missing_resources() -> None:
+    state = dict(_IN_FLIGHT)
+    state.pop("resources")
+    text = _auto_brief_line(state)
+    assert text.startswith(AUTO_BRIEF_PREFIX)
+    assert "Mock Rocket" in text
+
+
+def test_line_accepts_zero_to_100_percent_scale() -> None:
+    """模组若改成 0~100 也不能说出「电量 9100%」。"""
+    state = dict(_IN_FLIGHT)
+    state["resources"] = dict(_IN_FLIGHT["resources"], battery=91.0)
+    assert "电量 91%" in _auto_brief_line(state)
 
 
 # ── 推送行为 ──────────────────────────────────────────────────────────────

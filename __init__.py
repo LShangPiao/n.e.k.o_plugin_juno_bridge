@@ -513,6 +513,13 @@ _DOC_TASKS = """【常见任务的正确顺序】
 2. 讲给用户听的时候用游戏里的真实数字，不要背通用参数。"""
 
 _DOC_RULES = """【必须遵守的铁律】
+0. **上下文里已经有「【朱诺自动播报】」时，先直接用那条里的数字回答。**
+   那一行是插件在后台自己读来的真实遥测（高度/速度/轨道/燃料），
+   和 get_juno_status 返回的是同一份数据 —— 为了同一批数字再去调工具，
+   玩家只会觉得「她听到了却不理我，查到才回」。
+   自动播报里确实没有的细节（逐项资源、大气细节、星系表）才调工具；
+   要调、又可能要等一会儿时，**先说一句「我看一眼仪表」**再调，
+   不要一声不吭地卡在那里。
 1. 这个插件是**只读**的。你不能替他点火、分级、改变姿态、开关引擎、调油门。
    所有操作只能由玩家自己在游戏里做，你负责看数据和给建议。
    ⚠️ 不要说「我帮你点了」「我已经把引擎打开」这类话 —— 你做不到。
@@ -1351,10 +1358,33 @@ def _auto_brief_line(state: Dict[str, Any]) -> str:
     模组通了但游戏不在飞行场景时返回空串，表示「这条不用发」—— 主菜单、
     设计器、加载中反复播报「读不到飞行数据」只是浪费上下文。
     刻意压短：这一段会一直待在上下文里，跟着每一轮对话走。
+    但玩家最常追问的几项（燃料余量、Delta-V、推重比、电池）能塞就塞，
+    这样「油还够吗」「还剩多少 Delta-V」不必再走一次工具往返。
     """
     if not _as_bool(_as_dict(state).get("ok")):
         return ""
-    return AUTO_BRIEF_PREFIX + _summarize_state(state)
+    text = AUTO_BRIEF_PREFIX + _summarize_state(state)
+
+    resources = _as_dict(_as_dict(state).get("resources"))
+    extra: List[str] = []
+    if resources:
+        dv = _num(resources.get("delta_v_stage"))
+        if dv is not None and dv > 0:
+            extra.append(f"本级 Delta-V {dv:,.0f}")
+        twr = _num(resources.get("thrust_to_weight"))
+        if twr is not None and twr > 0:
+            extra.append(f"推重比 {twr:.2f}")
+        # 燃料 ≤10% 时 _summarize_state 已经专门警告过，这里不重复
+        fuel = _percent_of_100(resources.get("fuel_all_stages_percent"))
+        if fuel is not None and fuel > 10.0:
+            extra.append(f"全船燃料 {fuel:.0f}%")
+        battery = _percent_of_100(resources.get("battery"))
+        if battery is not None:
+            extra.append(f"电量 {battery:.0f}%")
+
+    if extra:
+        text += "（" + "，".join(extra) + "）"
+    return text
 
 
 def _summarize_orbit(orbit: Dict[str, Any]) -> str:
