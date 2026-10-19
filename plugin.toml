@@ -9,7 +9,7 @@ keywords = [
     "orbit", "telemetry", "vessel", "rocket", "apoapsis", "periapsis", "delta-v",
     "space", "aerospace", "atmosphere", "mach"
 ]
-version = "0.2.0"
+version = "0.2.1"
 type = "plugin"
 entry = "plugin.plugins.juno_bridge:JunoBridgePlugin"
 
